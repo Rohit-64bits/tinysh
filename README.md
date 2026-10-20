@@ -36,7 +36,7 @@ cd tinysh
 Compile:
 
 ```bash
-g++ -std=c++17 -Wall -Wextra -Wpedantic base.cpp -o tinysh
+g++ -std=c++17 -Wall -Wextra -Wpedantic myshell.cpp -o tinysh
 ```
 
 Run:
