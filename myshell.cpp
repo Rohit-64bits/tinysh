@@ -129,10 +129,12 @@ void waitforchilds(vector<pid_t>pids){
     }
 }
 //MULTIPLE PIPING
-void multiplepipe(vector<string>&args,string &sign,string &filename,int &last_status){
+void multiplepipe(vector<string>&args,string &sign,string &filename,int &last_status,bool isinteractive,pid_t shell_pid,bool background){
     vector<vector<string>>commands;
     vector<string>tmp;
     vector<pid_t>pids;
+    pid_t first_child_pid;
+    
     //build commands vector by splitting pipes
     for(string &s:args){
         if(s=="|"){
@@ -181,6 +183,22 @@ void multiplepipe(vector<string>&args,string &sign,string &filename,int &last_st
         cout.flush();
         pid_t pid =fork();
         if(pid==0){
+            //restore terminal job control signals in child
+            signal(SIGINT, SIG_DFL);
+            signal(SIGQUIT, SIG_DFL);
+            signal(SIGTSTP, SIG_DFL);
+            signal(SIGTTIN, SIG_DFL);
+            signal(SIGTTOU, SIG_DFL);
+            if(i==0){ //first child
+                if(setpgid(0,0)<0){
+                    perror("setpgid");
+                }
+            }
+            else{
+                if(setpgid(0,first_child_pid)<0){
+                    perror("setpgid");
+                }
+            }
             if(prev_read!=-1){ //not the first command
                 if(dup2(prev_read,STDIN_FILENO)==-1){
                     perror("dup2 stdin");
@@ -225,6 +243,17 @@ void multiplepipe(vector<string>&args,string &sign,string &filename,int &last_st
             return;
         }
         //parent
+        if(i==0){ //first child
+            if(setpgid(pid,pid)<0){
+                perror("setpgid");
+            }
+            first_child_pid=pid;
+        }
+        else{
+            if(setpgid(pid,first_child_pid)<0){
+                perror("setpgid");
+            }
+        }
         pids.push_back(pid);
         if(prev_read!=-1)close(prev_read);
         if(pipeflag){
@@ -234,24 +263,42 @@ void multiplepipe(vector<string>&args,string &sign,string &filename,int &last_st
         
         
     }
-    //wait for childs to finish
-    for(int i=0;i<pids.size();i++){
-        int status;
-        if(waitpid(pids[i],&status,0)==-1){
-            perror("waitpid");
-            return;
-        }
-        //last pid
-        if(i==pids.size()-1){
-            if(WIFEXITED(status)){
-                last_status=WEXITSTATUS(status);
+    if(!background){
+        if(isinteractive){
+            if(tcsetpgrp(STDIN_FILENO,first_child_pid)<0){
+                perror("tcsetpgrp");
+                last_status=1;
             }
-            else if(WIFSIGNALED(status)){
-                last_status=128+WTERMSIG(status);
+        }   
+        //wait for childs to finish
+        for(int i=0;i<pids.size();i++){
+            int status;
+            if(waitpid(pids[i],&status,0)==-1){
+                perror("waitpid");
+                return;
+            }
+            //last pid
+            if(i==pids.size()-1){
+                if(WIFEXITED(status)){
+                    last_status=WEXITSTATUS(status);
+                }
+                else if(WIFSIGNALED(status)){
+                    last_status=128+WTERMSIG(status);
+                }
             }
         }
+    }   
+    else{
+        cout<<"Process group with pgid ["<<first_child_pid<<"]"<<"has started"<<endl;
     }
+    
+    if(isinteractive && !background){
+    if(tcsetpgrp(STDIN_FILENO,shell_pid)<0){
+        perror("tcsetpgrp");
+    }
+    } 
     return;
+
 }
 
 void reapchilds(){
@@ -558,7 +605,7 @@ int main(){
         */
        pipepos=findpipe(args);
        if(pipepos!=-1){
-            multiplepipe(args,sign,filename,last_status);
+            multiplepipe(args,sign,filename,last_status,is_interactive,shellpgid,background);
             continue;
         }
         
