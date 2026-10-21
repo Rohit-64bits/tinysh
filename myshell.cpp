@@ -1,13 +1,14 @@
-#include<iostream>
-#include<string>
-#include<cctype>
-#include<vector>
+#include <iostream>
+#include <string>
+#include <cctype>
+#include <vector>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <cstdio>
 #include <cstdlib>
 #include <fcntl.h>
+#include <signal.h>
 using namespace std;
 
 
@@ -306,7 +307,38 @@ int main(){
 
     string command;
 
-    int last_status=0;
+    int last_status=0; //exit status of the most recently executed foreground command
+    bool is_interactive=isatty(STDIN_FILENO); //checks if the shell is interactive, not redirected inputs like ./myshell < commmands.txt
+    pid_t shellpgid;
+    if(is_interactive){
+        //wait until shell's pgid is in foreground
+        while(tcgetpgrp(STDIN_FILENO)!=(shellpgid=getpgrp())){
+            kill(-shellpgid,SIGTTIN);// '-' sign means we're targetting each process in that process group.
+            //SIGTTIN:Stop a background process group attempting terminal input
+        }
+        //The shell must not be stopped by terminal job control signals
+        signal(SIGINT, SIG_IGN);
+        signal(SIGQUIT, SIG_IGN);
+        signal(SIGTSTP, SIG_IGN);
+        signal(SIGTTIN, SIG_IGN);
+        signal(SIGTTOU, SIG_IGN);
+        //set shell's pid to its own process group
+        shellpgid=getpid();
+        if(setpgid(shellpgid,shellpgid)<0){
+            perror("setpgid");
+            return 1;
+        }
+        //set shell pgid to foreground
+        if(tcsetpgrp(STDIN_FILENO,shellpgid)<0){
+            perror("tcsetpgrp");
+            return 1;
+        }
+        //debug line
+        cout << "Shell PID: " << getpid() << endl;
+        cout << "Shell PGID: " << getpgrp() << endl;
+        cout << "Terminal foreground PGID: "
+            << tcgetpgrp(STDIN_FILENO) << endl;
+    }
 
     while(true){
         reapchilds(); //get updates each iterations
@@ -546,8 +578,21 @@ int main(){
         cout.flush();
         pid_t pid=fork();
         if(pid==0){
-            //restore ctrl+c behaviour for child processes
-            signal(SIGINT,SIG_DFL); //SIG_DFL:change to default
+            //set child's pi to its own pgid
+            if(setpgid(0,0)<0){//0: caller's pid
+                perror("setpgid");
+                _exit(1);
+            } 
+
+            /*//restore ctrl+c behaviour for child processes
+            signal(SIGINT,SIG_DFL); //SIG_DFL:change to default*/
+
+            //restore terminal job control signals in child
+            signal(SIGINT, SIG_DFL);
+            signal(SIGQUIT, SIG_DFL);
+            signal(SIGTSTP, SIG_DFL);
+            signal(SIGTTIN, SIG_DFL);
+            signal(SIGTTOU, SIG_DFL);
             // command > filename
             if(redirect_pos!=-1){
                 int fd=-1;
@@ -567,6 +612,11 @@ int main(){
     
         }
         else if(pid>0){
+            
+            if(setpgid(pid,pid)<0){//implement the same in parent block to account for race condition
+                perror("setpgid");
+                last_status=1;
+            } 
             //if background process, we dont waitpid
             if(background){
                 cout<<"process"<<" ["<<pid<<"] "<<"has started"<<endl;
@@ -574,10 +624,22 @@ int main(){
             }
             else{
                 int status;
+                //give foreground access to the child pgid
+                if(is_interactive){
+                    if(tcsetpgrp(STDIN_FILENO,pid)<0){
+                        perror("tcsetpgrp");
+                    }
+                }    
                 if(waitpid(pid,&status,0)==-1){
                     perror("waitpid");
                     return 1;
                 }
+                //recover foreground access to shell
+                if(is_interactive){
+                    if(tcsetpgrp(STDIN_FILENO,shellpgid)<0){
+                        perror("tcsetpgrp");
+                    }
+                }    
                 if(WIFEXITED(status)){
                     last_status= WEXITSTATUS(status);
                 }
