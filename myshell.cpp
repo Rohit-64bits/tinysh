@@ -369,6 +369,8 @@ int main(){
     int last_status=0; //exit status of the most recently executed foreground command
     bool is_interactive=isatty(STDIN_FILENO); //checks if the shell is interactive, not redirected inputs like ./myshell < commmands.txt
     pid_t shellpgid=getpgrp();
+    pid_t stopped_pgid;
+    bool stopped=false;
     if(is_interactive){
         //wait until shell's pgid is in foreground
         while(tcgetpgrp(STDIN_FILENO)!=(shellpgid=getpgrp())){
@@ -410,7 +412,6 @@ int main(){
         bool background=false;
         int pipepos;
         int redirect_pos;
-
         cout<<"myshell$ ";
         if(!getline(cin,command)){
             cout<<endl;
@@ -473,7 +474,60 @@ int main(){
             else last_status=0;
             continue;
         }
+        //fd:resume stopped jobs
+        else if(args.size()==1&&args[0]=="fd"){
+            if(stopped){
+                int status;
+                if(is_interactive){ 
+                    if(tcsetpgrp(STDIN_FILENO,stopped_pgid)<0){
+                        perror("tcsetpgid");
+                        last_status=1;
+                        continue; //abort this fd session
+                    }
+                }
+                if(kill(-stopped_pgid,SIGCONT)<0){ //SIGCONT:continue signal
+                    perror("kill");
+                    //restore terminal foreground
+                    if(is_interactive){ 
+                        if(tcsetpgrp(STDIN_FILENO,shellpgid)<0){
+                            perror("tcsetpgid");
+                            last_status=1;
+                        }
+                    }
+                    continue;
+                }
+                cout<<"Process group ["<<stopped_pgid<<"] "<<"resumed"<<endl;
+                if(retry_waitpid(-stopped_pgid,&status,WUNTRACED)==-1){
+                    perror("waitpid");
+                    last_status=1;
+                }
+                else if(WIFEXITED(status)){
+                    last_status= WEXITSTATUS(status);
+                    stopped=false;
+                }
+                else if(WIFSIGNALED(status)){
+                    last_status=128+WTERMSIG(status);
+                    stopped=false;
+                }
+                else if(WIFSTOPPED(status)){
+                    cout<<"pgid ["<<stopped_pgid<<"] "<<"stopped"<<endl;
+                    stopped=true;
+                }
+                if(is_interactive){ 
+                    if(tcsetpgrp(STDIN_FILENO,shellpgid)<0){
+                        perror("tcsetpgid");
+                        last_status=1;
+                    }
+                }
+                continue;
+        }
+        else{
+            cout<<"No Jobs to resume"<<endl;
+            last_status=1;
+            continue;
+        }
 
+        }
 
         //command1 Pipe command2
         /*pipepos=findpipe(args);
@@ -692,7 +746,7 @@ int main(){
                         perror("tcsetpgrp");
                     }
                 }    
-                if(retry_waitpid(pid,&status,0)==-1){
+                if(retry_waitpid(pid,&status,WUNTRACED)==-1){
                     perror("waitpid");
                     last_status=1;
                 }
@@ -701,6 +755,11 @@ int main(){
                 }
                 else if(WIFSIGNALED(status)){
                     last_status=128+WTERMSIG(status);
+                }
+                else if(WIFSTOPPED(status)){
+                    cout<<"pid ["<<pid<<"] "<<"stopped"<<endl;
+                    stopped_pgid=pid;
+                    stopped=true;
                 }
                 //recover foreground access to shell
                 if(is_interactive){
