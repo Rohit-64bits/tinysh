@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <fcntl.h>
 #include <signal.h>
+#include <cerrno>
 using namespace std;
 
 
@@ -118,13 +119,20 @@ bool splitpipe(const vector<string>&args,vector<string>&left,vector<string>&righ
     for(int i=pos+1;i<static_cast<int>(args.size());i++)right.push_back(args[i]);
     return true;
 }
+pid_t retry_waitpid(pid_t pid, int* last_status,int options=0){
+    pid_t result;
+    do{
+        result= waitpid(pid,last_status,options);
+    }while(result == -1 && errno==EINTR);
+    return result;
+}
 void waitforchilds(vector<pid_t>pids){
     //wait for the generated childs to finish
     for(int i=0;i<pids.size();i++){
         int status;
-        if(waitpid(pids[i],&status,0)==-1){
+        if(retry_waitpid(pids[i],&status,0)==-1){
             perror("waitpid");
-            return;
+            //continue reaping rest of childs
         }
     }
 }
@@ -264,6 +272,8 @@ void multiplepipe(vector<string>&args,string &sign,string &filename,int &last_st
         
     }
     if(!background){
+        bool waitpid_failed=false;
+        int pipe_status;
         if(isinteractive){
             if(tcsetpgrp(STDIN_FILENO,first_child_pid)<0){
                 perror("tcsetpgrp");
@@ -273,20 +283,22 @@ void multiplepipe(vector<string>&args,string &sign,string &filename,int &last_st
         //wait for childs to finish
         for(int i=0;i<pids.size();i++){
             int status;
-            if(waitpid(pids[i],&status,0)==-1){
+            if(retry_waitpid(pids[i],&status)==-1){
                 perror("waitpid");
-                return;
+                waitpid_failed=true;
+                continue; //try waitiing for other childs
             }
             //last pid
             if(i==pids.size()-1){
                 if(WIFEXITED(status)){
-                    last_status=WEXITSTATUS(status);
+                    pipe_status=WEXITSTATUS(status);
                 }
                 else if(WIFSIGNALED(status)){
-                    last_status=128+WTERMSIG(status);
+                    pipe_status=128+WTERMSIG(status);
                 }
             }
         }
+        last_status=waitpid_failed?1:pipe_status;
     }   
     else{
         cout<<"Process group with pgid ["<<first_child_pid<<"]"<<"has started"<<endl;
@@ -356,7 +368,7 @@ int main(){
 
     int last_status=0; //exit status of the most recently executed foreground command
     bool is_interactive=isatty(STDIN_FILENO); //checks if the shell is interactive, not redirected inputs like ./myshell < commmands.txt
-    pid_t shellpgid;
+    pid_t shellpgid=getpgrp();
     if(is_interactive){
         //wait until shell's pgid is in foreground
         while(tcgetpgrp(STDIN_FILENO)!=(shellpgid=getpgrp())){
@@ -409,6 +421,7 @@ int main(){
 
         //implementation
         if(!splitargs(command,args)){
+            last_status=2;
             continue;
         }
         if(args.empty()){
@@ -417,7 +430,10 @@ int main(){
         else if(args.back()=="&"){
             background=true;
             args.pop_back();
-            if(args.empty())continue;
+            if(args.empty()){
+                last_status=2; //syntax error
+                continue;
+            }
         }
 
 
@@ -625,7 +641,7 @@ int main(){
         cout.flush();
         pid_t pid=fork();
         if(pid==0){
-            //set child's pi to its own pgid
+            //set child's pid to its own pgid
             if(setpgid(0,0)<0){//0: caller's pid
                 perror("setpgid");
                 _exit(1);
@@ -643,9 +659,8 @@ int main(){
             // command > filename
             if(redirect_pos!=-1){
                 int fd=-1;
-                if(!BuildFDforRedirection(filename,sign,fd)){
-                    last_status=2;
-                    _exit(1);
+                if(!BuildFDforRedirection(filename,sign,fd)){;
+                    _exit(2);
                 }
                 
             }
@@ -677,9 +692,15 @@ int main(){
                         perror("tcsetpgrp");
                     }
                 }    
-                if(waitpid(pid,&status,0)==-1){
+                if(retry_waitpid(pid,&status,0)==-1){
                     perror("waitpid");
-                    return 1;
+                    last_status=1;
+                }
+                else if(WIFEXITED(status)){
+                    last_status= WEXITSTATUS(status);
+                }
+                else if(WIFSIGNALED(status)){
+                    last_status=128+WTERMSIG(status);
                 }
                 //recover foreground access to shell
                 if(is_interactive){
@@ -687,12 +708,6 @@ int main(){
                         perror("tcsetpgrp");
                     }
                 }    
-                if(WIFEXITED(status)){
-                    last_status= WEXITSTATUS(status);
-                }
-                else if(WIFSIGNALED(status)){
-                    last_status=128+WTERMSIG(status);
-                }
             }
         }
         else {
