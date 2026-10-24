@@ -10,8 +10,15 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <cerrno>
+#include <unordered_map>
 using namespace std;
 
+
+enum class processState{
+    Stopped,
+    Running,
+    Exited
+};
 
 
 
@@ -20,7 +27,7 @@ bool splitargs(string &command,vector<string>&args){
     string tmp;
     bool inside_dbquote=false;
     bool inside_squote=false;
-    bool escaped=false; //for  " \"sjv\" " type cases
+    bool escaped=false; //for  " \"cat\" " type cases
     for(char c:command){
         if(escaped){
             tmp+=c;
@@ -136,12 +143,20 @@ void waitforchilds(vector<pid_t>pids){
         }
     }
 }
+bool isProcessgroupStopped(const vector<pid_t>&pids,unordered_map<pid_t,processState>&stopmap){
+    bool stopdetected=false;
+    for(pid_t p:pids){
+        if(stopmap[p]==processState::Running)return false;
+        else if(stopmap[p]==processState::Stopped)stopdetected=true;
+    }
+    return (stopdetected)?true:false;
+}
 //MULTIPLE PIPING
-void multiplepipe(vector<string>&args,string &sign,string &filename,int &last_status,bool isinteractive,pid_t shell_pid,bool background){
+void multiplepipe(vector<string>&args,string &sign,string &filename,int &last_status,bool &isinteractive,pid_t &shell_pid,bool background,bool &stopped,vector<pid_t>&pids,
+    unordered_map<pid_t,processState>&stopmap,pid_t &stopped_pgid,pid_t &pgid){
+
     vector<vector<string>>commands;
     vector<string>tmp;
-    vector<pid_t>pids;
-    pid_t first_child_pid;
     
     //build commands vector by splitting pipes
     for(string &s:args){
@@ -203,7 +218,7 @@ void multiplepipe(vector<string>&args,string &sign,string &filename,int &last_st
                 }
             }
             else{
-                if(setpgid(0,first_child_pid)<0){
+                if(setpgid(0,pgid)<0){
                     perror("setpgid");
                 }
             }
@@ -255,14 +270,15 @@ void multiplepipe(vector<string>&args,string &sign,string &filename,int &last_st
             if(setpgid(pid,pid)<0){
                 perror("setpgid");
             }
-            first_child_pid=pid;
+            pgid=pid;
         }
         else{
-            if(setpgid(pid,first_child_pid)<0){
+            if(setpgid(pid,pgid)<0){
                 perror("setpgid");
             }
         }
         pids.push_back(pid);
+        stopmap[pid]=processState::Running;
         if(prev_read!=-1)close(prev_read);
         if(pipeflag){
             close(fd[1]);
@@ -275,7 +291,7 @@ void multiplepipe(vector<string>&args,string &sign,string &filename,int &last_st
         bool waitpid_failed=false;
         int pipe_status;
         if(isinteractive){
-            if(tcsetpgrp(STDIN_FILENO,first_child_pid)<0){
+            if(tcsetpgrp(STDIN_FILENO,pgid)<0){
                 perror("tcsetpgrp");
                 last_status=1;
             }
@@ -283,30 +299,56 @@ void multiplepipe(vector<string>&args,string &sign,string &filename,int &last_st
         //wait for childs to finish
         for(int i=0;i<pids.size();i++){
             int status;
-            if(retry_waitpid(pids[i],&status)==-1){
+            if(retry_waitpid(pids[i],&status,WUNTRACED)==-1){
                 perror("waitpid");
                 waitpid_failed=true;
                 continue; //try waitiing for other childs
+            }
+            if(WIFSTOPPED(status)){
+                stopmap[pids[i]]=processState::Stopped;
+            }
+            else if(WIFEXITED(status)){
+                stopmap[pids[i]]=processState::Exited;
+            }
+            else if(WIFSIGNALED(status)){
+                stopmap[pids[i]]=processState::Exited;
             }
             //last pid
             if(i==pids.size()-1){
                 if(WIFEXITED(status)){
                     pipe_status=WEXITSTATUS(status);
+                    last_status=waitpid_failed?1:pipe_status;
                 }
                 else if(WIFSIGNALED(status)){
                     pipe_status=128+WTERMSIG(status);
+                    last_status=waitpid_failed?1:pipe_status;
                 }
             }
         }
-        last_status=waitpid_failed?1:pipe_status;
+        
+        //if process group stopped
+        if(isProcessgroupStopped(pids,stopmap)){
+            cout<<"Process group with pgid ["<<pgid<<"] "<<"stopped"<<endl;
+            stopped=true;
+            stopped_pgid=pgid;
+            //restore terminal foreground
+            if(isinteractive){
+                if(tcsetpgrp(STDIN_FILENO,shell_pid)<0){
+                    perror("tcsetpgrp");
+                    last_status=1;
+                    return;
+                }
+            }
+        }
     }   
     else{
-        cout<<"Process group with pgid ["<<first_child_pid<<"]"<<"has started"<<endl;
+        cout<<"Process group with pgid ["<<pgid<<"]"<<"has started"<<endl;
     }
     
     if(isinteractive && !background){
     if(tcsetpgrp(STDIN_FILENO,shell_pid)<0){
         perror("tcsetpgrp");
+        last_status=1;
     }
     } 
     return;
@@ -369,8 +411,12 @@ int main(){
     int last_status=0; //exit status of the most recently executed foreground command
     bool is_interactive=isatty(STDIN_FILENO); //checks if the shell is interactive, not redirected inputs like ./myshell < commmands.txt
     pid_t shellpgid=getpgrp();
-    pid_t stopped_pgid;
-    bool stopped=false;
+    pid_t stopped_pgid=0;
+    bool stopped=false; 
+
+    vector<pid_t>pids;
+    unordered_map<pid_t,processState>stopmap;
+    pid_t pgid=0;
     if(is_interactive){
         //wait until shell's pgid is in foreground
         while(tcgetpgrp(STDIN_FILENO)!=(shellpgid=getpgrp())){
@@ -412,6 +458,13 @@ int main(){
         bool background=false;
         int pipepos;
         int redirect_pos;
+        if(!stopped){
+            pids.clear();
+            stopmap.clear();
+
+        }
+    
+
         cout<<"myshell$ ";
         if(!getline(cin,command)){
             cout<<endl;
@@ -485,7 +538,7 @@ int main(){
                         continue; //abort this fd session
                     }
                 }
-                if(kill(-stopped_pgid,SIGCONT)<0){ //SIGCONT:continue signal
+                if(kill(-stopped_pgid,SIGCONT)<0){ //SIGCONT:continue signal, -stopped_pgid sends this seignal to each child of this group
                     perror("kill");
                     //restore terminal foreground
                     if(is_interactive){ 
@@ -496,23 +549,35 @@ int main(){
                     }
                     continue;
                 }
-                cout<<"Process group ["<<stopped_pgid<<"] "<<"resumed"<<endl;
-                if(retry_waitpid(-stopped_pgid,&status,WUNTRACED)==-1){
-                    perror("waitpid");
-                    last_status=1;
+                for(size_t i=0;i<pids.size();i++){
+                    if(stopmap[pids[i]]==processState::Stopped){
+                        stopmap[pids[i]]=processState::Running;
+                        if(retry_waitpid(pids[i],&status,WUNTRACED)==-1){
+                            perror("waitpid");
+                            last_status=1;
+                        }
+                        else if(WIFEXITED(status)){
+                            if(i==pids.size()-1) last_status= WEXITSTATUS(status); //last_status update according to last child 
+                            stopmap[pids[i]]=processState::Exited;
+                        }
+                        else if(WIFSIGNALED(status)){
+                            if(i==pids.size()-1) last_status=128+WTERMSIG(status);
+                            stopmap[pids[i]]=processState::Exited;
+                        }
+                        else if(WIFSTOPPED(status)){
+                            stopmap[pids[i]]=processState::Stopped;
+                        }
+                    }
                 }
-                else if(WIFEXITED(status)){
-                    last_status= WEXITSTATUS(status);
+                if(isProcessgroupStopped(pids,stopmap)){
+                    cout<<"Process group with pgid ["<<stopped_pgid<<"] "<<"stopped"<<endl;
+
+                }
+                else{ 
+                    //cout<<"Process group ["<<stopped_pgid<<"] "<<"resumed"<<endl;
                     stopped=false;
                 }
-                else if(WIFSIGNALED(status)){
-                    last_status=128+WTERMSIG(status);
-                    stopped=false;
-                }
-                else if(WIFSTOPPED(status)){
-                    cout<<"pgid ["<<stopped_pgid<<"] "<<"stopped"<<endl;
-                    stopped=true;
-                }
+                //restore terminal foreground to shell
                 if(is_interactive){ 
                     if(tcsetpgrp(STDIN_FILENO,shellpgid)<0){
                         perror("tcsetpgid");
@@ -675,7 +740,7 @@ int main(){
         */
        pipepos=findpipe(args);
        if(pipepos!=-1){
-            multiplepipe(args,sign,filename,last_status,is_interactive,shellpgid,background);
+            multiplepipe(args,sign,filename,last_status,is_interactive,shellpgid,background,stopped,pids,stopmap,stopped_pgid,pgid);
             continue;
         }
         
@@ -695,7 +760,7 @@ int main(){
         cout.flush();
         pid_t pid=fork();
         if(pid==0){
-            //set child's pid to its own pgid
+            //set child's pid to pgid
             if(setpgid(0,0)<0){//0: caller's pid
                 perror("setpgid");
                 _exit(1);
@@ -733,6 +798,9 @@ int main(){
                 perror("setpgid");
                 last_status=1;
             } 
+            pgid=pid;
+            pids.push_back(pid);
+            stopmap[pid]=processState::Running;
             //if background process, we dont waitpid
             if(background){
                 cout<<"process"<<" ["<<pid<<"] "<<"has started"<<endl;
@@ -752,14 +820,17 @@ int main(){
                 }
                 else if(WIFEXITED(status)){
                     last_status= WEXITSTATUS(status);
+                    stopmap[pid]=processState::Exited;
                 }
                 else if(WIFSIGNALED(status)){
                     last_status=128+WTERMSIG(status);
+                    stopmap[pid]=processState::Exited;
                 }
                 else if(WIFSTOPPED(status)){
                     cout<<"pid ["<<pid<<"] "<<"stopped"<<endl;
                     stopped_pgid=pid;
                     stopped=true;
+                    stopmap[pid]=processState::Stopped;
                 }
                 //recover foreground access to shell
                 if(is_interactive){
